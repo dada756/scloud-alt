@@ -8,7 +8,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 // We are now running on standard Node.js to support HTTPS Proxy Agents
 export const dynamic = 'force-dynamic';
 
-const BROWSER_TOKEN = "3f132a0c3d414a8fb4a02775f61b6a04|7e902b4485babe129208d474402e921516f2f0d8b2b98cd23fb8a2e226bef6d3";
+const BROWSER_TOKEN = "3f132a0c3d414a8fb4d02775f61b6a04|7e902b4485babe129208d474402e911516f2f0d8b2b98cd23fb8a2e226bef6d3";
 let cachedToken: any = null;
 
 // Helper to randomly select and format a residential proxy
