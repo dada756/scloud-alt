@@ -7,70 +7,41 @@ export const dynamic = 'force-dynamic';
 
 const BROWSER_TOKEN = "3f132a0c3d414a8fb4a02775f61b6a04|7e902b4485babe129208d474402e921516f2f0d8b2b98cd23fb8a2e226bef6d3";
 
+// Global cache for Edge Warm Starts
+let cachedToken: any = null;
+
 export async function POST(request: Request) {
   try {
     const { query } = await request.json();
-    if (!query) {
-      return NextResponse.json({ error: 'Query is required' }, { status: 400 });
-    }
+    if (!query) return NextResponse.json({ error: 'Query is required' }, { status: 400 });
 
     const searchQuery = query.replace(/ /g, '+');
-
-    // 1. Fetch current active token & system state from D1
-    const tokenRows = await queryD1(
-      "SELECT * FROM tokens WHERE status = 'active' OR status = 'queued' ORDER BY status ASC, created_at DESC LIMIT 1"
-    );
-    const lockRows = await queryD1(
-      "SELECT state_value FROM system_state WHERE state_key = 'git_workflow_triggered' LIMIT 1"
-    );
-
-    let activeTokenRow = tokenRows?.[0];
-    const isWorkflowLocked = lockRows?.[0]?.state_value === 'true';
-
-    // 2. Token Integrity & Expiration Check
     const now = new Date();
-    if (activeTokenRow) {
-      const expiresAt = new Date(activeTokenRow.expires_at);
-      // If token expired or hit absolute max limit, deplete it
-      if (now >= expiresAt || activeTokenRow.search_count >= 45) {
-        await queryD1("UPDATE tokens SET status = 'depleted' WHERE id = ?", [activeTokenRow.id]);
-        
-        // Try fetching a backup queued token instantly
-        const backupRows = await queryD1("SELECT * FROM tokens WHERE status = 'queued' ORDER BY created_at DESC LIMIT 1");
-        if (backupRows?.[0]) {
-          activeTokenRow = backupRows[0];
-          await queryD1("UPDATE tokens SET status = 'active' WHERE id = ?", [activeTokenRow.id]);
-        } else {
-          activeTokenRow = null;
-        }
-      } else if (activeTokenRow.status === 'queued') {
-        // Elevate first queued token if no active token existed
-        await queryD1("UPDATE tokens SET status = 'active' WHERE id = ?", [activeTokenRow.id]);
-        activeTokenRow.status = 'active';
+
+    // 1. LIGHTNING READ: Check Edge Cache first, fallback to D1
+    if (!cachedToken || now >= new Date(cachedToken.expires_at) || cachedToken.search_count >= 40) {
+      const tokenRows = await queryD1(
+        "SELECT * FROM tokens WHERE status = 'active' OR status = 'queued' ORDER BY status ASC, created_at DESC LIMIT 1"
+      );
+      cachedToken = tokenRows?.[0] || null;
+      
+      // If we had to promote a queued token, do it in the background
+      if (cachedToken && cachedToken.status === 'queued') {
+        cachedToken.status = 'active';
+        queryD1("UPDATE tokens SET status = 'active' WHERE id = ?", [cachedToken.id]).catch(console.error);
       }
     }
 
-    if (!activeTokenRow) {
-      // Trigger emergency run if everything is dead and no workflow is active
-      if (!isWorkflowLocked) {
-        await triggerGitHubWorkflow();
-      }
-      return NextResponse.json({ error: 'System is initializing clearance tokens. Please try again shortly.' }, { status: 503 });
+    if (!cachedToken) {
+      return NextResponse.json({ error: 'System is initializing clearance tokens.' }, { status: 503 });
     }
 
-    // 3. Increment Counter & Milestone Check (Trigger at exactly 40 searches)
-    const newCount = activeTokenRow.search_count + 1;
-    await queryD1("UPDATE tokens SET search_count = ? WHERE id = ?", [newCount, activeTokenRow.id]);
-
-    if (newCount === 40 && !isWorkflowLocked) {
-      await triggerGitHubWorkflow();
-    }
-
-    // 4. HOLY HEADERS EXECUTION (100% Unmodified from Original Blueprint)
+    // 2. CRITICAL PATH: Immediately execute the target scrape (Do not wait for DB updates)
+    const ad_verified = cachedToken.token_value;
     const url = "https://scloudx.lol/get-search-token";
-    const ad_verified = activeTokenRow.token_value;
-
-    const response = await fetch(url, {
+    
+    // Start the fetch promise IMMEDIATELY
+    const targetFetchPromise = fetch(url, {
       method: 'POST',
       headers: {
         "Host": "scloudx.lol",
@@ -97,9 +68,24 @@ export async function POST(request: Request) {
       cache: 'no-store'
     });
 
-    if (!response.ok) {
-      throw new Error(`Target search failed with status ${response.status}`);
+    // 3. BACKGROUND TASKS: Update D1 and check triggers while the fetch is happening
+    cachedToken.search_count += 1;
+    const backgroundTasks = [];
+    
+    backgroundTasks.push(
+      queryD1("UPDATE tokens SET search_count = ? WHERE id = ?", [cachedToken.search_count, cachedToken.id])
+    );
+
+    if (cachedToken.search_count === 40) {
+      backgroundTasks.push(triggerGitHubWorkflow());
     }
+
+    // Fire and forget background tasks
+    Promise.allSettled(backgroundTasks);
+
+    // 4. RESOLVE CRITICAL PATH: Process HTML and return
+    const response = await targetFetchPromise;
+    if (!response.ok) throw new Error(`Target search failed: ${response.status}`);
 
     const html = await response.text();
     const $ = cheerio.load(html);
@@ -109,8 +95,7 @@ export async function POST(request: Request) {
       const title = $(element).attr('data-title') || 'Unknown Title';
       const size = $(element).attr('data-size') || 'Unknown Size';
       const urlVal = $(element).find('.copy-checkbox').attr('data-url') || '';
-
-      results.push({ title, size, url: urlVal }); 
+      results.push({ title, size, url: urlVal });
     });
 
     return NextResponse.json({ status: "success", results, count: results.length });
@@ -121,29 +106,22 @@ export async function POST(request: Request) {
   }
 }
 
-// Helper to asynchronously execute the GitHub Dispatch Event
 async function triggerGitHubWorkflow() {
   try {
-    // Instantly claim the lock in D1 to prevent execution race conditions
+    const lockRows = await queryD1("SELECT state_value FROM system_state WHERE state_key = 'git_workflow_triggered' LIMIT 1");
+    if (lockRows?.[0]?.state_value === 'true') return;
+
     await queryD1("UPDATE system_state SET state_value = 'true' WHERE state_key = 'git_workflow_triggered'");
-
-    const repoOwner = process.env.GITHUB_REPO_OWNER;
-    const repoName = process.env.GITHUB_REPO_NAME;
-    const pat = process.env.GITHUB_PAT;
-
-    // Fire-and-forget call to GitHub Rest API
-    fetch(`https://api.github.com/repos/${repoOwner}/${repoName}/dispatches`, {
+    fetch(`https://api.github.com/repos/${process.env.GITHUB_REPO_OWNER}/${process.env.GITHUB_REPO_NAME}/dispatches`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${pat}`,
+        'Authorization': `Bearer ${process.env.GITHUB_PAT}`,
         'Accept': 'application/vnd.github.v3+json',
         'User-Agent': 'Vercel-Edge-Muxer'
       },
       body: JSON.stringify({ event_type: 'generate-clearance-token' })
     });
   } catch (err) {
-    console.error('Failed to dispatch GitHub Action:', err);
-    // Safe reset fallback
-    await queryD1("UPDATE system_state SET state_value = 'false' WHERE state_key = 'git_workflow_triggered'");
+    console.error('GitHub trigger failed:', err);
   }
 }
