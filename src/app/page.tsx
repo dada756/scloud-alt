@@ -6,7 +6,7 @@ export default function Home() {
       <div className="w-full max-w-5xl mb-18">
         {/* Hero Section */}
         <h1 className="text-7xl font-black text-accent mb-2">SCLOUD</h1>
-        <p className="text-2xl text-gray-300 font-bold mb-12">@iP00Lencodes</p>
+        <p className="text-2xl text-gray-300 font-bold mb-12">Telegram @iP00Lencodes</p>
 
         {/* Search Input */}
         <SearchBar />
